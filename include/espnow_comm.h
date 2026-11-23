@@ -109,6 +109,12 @@ void process_pending_received_config(void);
 void update_async_model_config_sender(void);
 
 void trigger_async_model_config_send(const ModelConfig &config, const uint8_t *peer_mac);
+
+/** @brief Records an immediate failure returned by esp_now_send for a live-control frame. */
+void record_live_control_send_result(esp_err_t result);
+
+/** @brief Emits a rate-limited summary of ESP-NOW MAC send results when diagnostics are enabled. */
+void update_espnow_diagnostics(void);
 #pragma endregion
 
 #endif // ESPNOW_COMM_H

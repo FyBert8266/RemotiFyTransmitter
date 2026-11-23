@@ -21,6 +21,8 @@ portMUX_TYPE configMux = portMUX_INITIALIZER_UNLOCKED;
 
 static TaskHandle_t core0TaskHandle = NULL;
 static volatile float core0_hz = 0.0f;
+static ModelConfig localConfigCopy;
+static ModelConfig fingerprintConfig;
 
 // Externer Bezug auf den virtuellen Rohwert-Puffer aus dem Dashboard
 extern uint16_t virtual_channel_raw[MAX_CHANNELS];
@@ -59,9 +61,9 @@ static void core0_realtime_task(void *pvParameters) {
   unsigned long lastSend = 0;
   uint32_t cycle_counter = 0;
   unsigned long last_hz_check = millis();
-
-  // Lokale Arbeitskopie der Konfiguration, um den Mutex nur fuer Mikrosekunden zu sperren
-  ModelConfig localConfigCopy;
+  uint32_t liveSequence = 0;
+  uint32_t cachedConfigFingerprint = 0;
+  bool configFingerprintInitialized = false;
 
   for (;;) {
     // 1. Nicht-blockierendes I2C-Caching der analogen Achsen (Round-Robin)
@@ -80,6 +82,15 @@ static void core0_realtime_task(void *pvParameters) {
       LiveControlMessage liveData;
       liveData.packetType = MSG_TYPE_LIVE_DATA;
       liveData.channelCount = localConfigCopy.channelCount;
+      liveData.protocolVersion = LIVE_CONTROL_PROTOCOL_VERSION;
+      liveData.sequence = ++liveSequence;
+      if (!configFingerprintInitialized ||
+          memcmp(&fingerprintConfig, &localConfigCopy, sizeof(ModelConfig)) != 0) {
+        fingerprintConfig = localConfigCopy;
+        cachedConfigFingerprint = model_config_fingerprint(localConfigCopy);
+        configFingerprintInitialized = true;
+      }
+      liveData.configFingerprint = cachedConfigFingerprint;
 
       for (int i = 0; i < localConfigCopy.channelCount && i < MAX_CHANNELS; i++) {
         uint8_t hw_id = localConfigCopy.channels[i].hardwareInputChannel;
@@ -110,7 +121,7 @@ static void core0_realtime_task(void *pvParameters) {
           }
         }
 
-        liveData.channelValues[i] = calculateProcessedChannelValue(i, raw_pwm);
+        liveData.channelValues[i] = calculateProcessedChannelValue(localConfigCopy, i, raw_pwm);
 
         if (strcmp(localConfigCopy.channels[i].name, "WINCH") == 0 && is_winch_locked()) {
           liveData.channelValues[i] = 1500;
@@ -118,11 +129,24 @@ static void core0_realtime_task(void *pvParameters) {
       }
 
       // Ziel-MAC aus aktiver Modellauswahl oder Fallback receiverMAC verwenden
-      const uint8_t *targetMac = (activeModelIndex >= 0 && activeModelIndex < pairedModelCount)
+      const uint8_t *targetMac = (pairedModels != NULL &&
+                                  activeModelIndex >= 0 &&
+                                  activeModelIndex < pairedModelCount &&
+                                  activeModelIndex < MAX_PAIRED_MODELS)
                                    ? pairedModels[activeModelIndex].macAddress
                                    : receiverMAC;
 
-      esp_now_send(targetMac, (uint8_t *)&liveData, sizeof(LiveControlMessage));
+      bool validTarget = false;
+      for (uint8_t i = 0; i < 6; ++i) {
+        if (targetMac[i] != 0) {
+          validTarget = true;
+          break;
+        }
+      }
+      if (validTarget && liveData.channelCount > 0 && liveData.channelCount <= MAX_CHANNELS) {
+        esp_err_t sendResult = esp_now_send(targetMac, (uint8_t *)&liveData, sizeof(LiveControlMessage));
+        record_live_control_send_result(sendResult);
+      }
     }
 
     // 3. Frequenz-Monitoring fuer Core 0

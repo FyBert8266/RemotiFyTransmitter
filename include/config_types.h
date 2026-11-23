@@ -33,6 +33,7 @@
 #define PAIRING_ACTION_CONFIRM   0x02
 #define PAIRING_ACTION_ACK       0x03
 #define PAIRING_PROTOCOL_VERSION 1
+#define LIVE_CONTROL_PROTOCOL_VERSION 1
 
 
 // ============================================================
@@ -99,13 +100,27 @@ struct __attribute__((packed)) ModelConfig {
   ChannelConfig channels[MAX_CHANNELS];
 };
 
+/** @brief Calculates a stable non-cryptographic fingerprint for matching model configurations. */
+static inline uint32_t model_config_fingerprint(const ModelConfig &config) {
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&config);
+  uint32_t fingerprint = 2166136261UL;
+  for (size_t i = 0; i < sizeof(config); ++i) {
+    fingerprint = (fingerprint ^ bytes[i]) * 16777619UL;
+  }
+  return fingerprint;
+}
 
 
 struct __attribute__((packed)) LiveControlMessage {
   uint8_t packetType = 0x99;
   uint8_t channelCount;
+  uint8_t protocolVersion;
+  uint32_t sequence;
+  uint32_t configFingerprint;
   uint16_t channelValues[MAX_CHANNELS];
 };
+
+static_assert(sizeof(LiveControlMessage) == 59, "Unexpected live-control wire format");
 
 /**
  * @brief Struktur fuer den Empfaenger-Status (Multi-Sender Lock / IS_BUSY).
@@ -160,8 +175,12 @@ struct __attribute__((packed)) ESPNowTransferMessage {
   uint8_t chunkIndex;
   uint8_t totalChunks;
   uint8_t dataLength;
+  uint16_t transferId;
   uint8_t payload[240];
 };
+
+static_assert(sizeof(ESPNowTransferMessage) == 246, "Unexpected ESP-NOW transfer wire format");
+static_assert((sizeof(ModelConfig) + 239U) / 240U < 32U, "ModelConfig requires too many ESP-NOW chunks");
 
 // Kalibrierungsstrukturen für analoge Achsen und System-Settings (Gerätespezifisch)
 struct __attribute__((packed)) AnalogCalibration {
@@ -187,5 +206,7 @@ struct __attribute__((packed)) PairingMessage {
   char modelName[MAX_NAME_LEN];
   char senderName[MAX_NAME_LEN];
 };
+
+static_assert(sizeof(PairingMessage) == 45, "Unexpected pairing wire format");
 
 #endif // CONFIG_TYPES_H

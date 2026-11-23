@@ -26,6 +26,7 @@
 #include "SerialInterface.h"
 #include "audio_module.h"
 #include "pairing_manager.h"
+#include "model_page.h"
 
 // Externe Deklaration der Verarbeitungsfunktion fuer empfangene Konfigurationen (model_page.cpp)
 extern void handle_received_config_logic(void);
@@ -95,7 +96,12 @@ lv_obj_t *model_btn_array[MAX_VISIBLE_TOP_BAR];
 ModelConfig pendingIncomingConfig;
 static ModelConfig incomingConfigBuffer;
 static uint8_t expectedSenderChunks = 0;
-static uint8_t receivedSenderChunksCounter = 0;
+static uint32_t receivedSenderChunksMask = 0;
+static uint16_t activeSenderTransferId = 0;
+static uint8_t senderTransferSourceMAC[6] = {0};
+static bool senderConfigTransferActive = false;
+static unsigned long lastSenderChunkMs = 0;
+static const unsigned long senderChunkTimeoutMs = 1000;
 static volatile bool pendingConfigReadyToProcess = false;
 
 // Globale Variablen fuer den asynchronen Config-Versand
@@ -103,9 +109,27 @@ static bool isSendingConfigAsync = false;
 static int asyncBytesSent = 0;
 static uint8_t asyncChunkIdx = 0;
 static uint8_t asyncTotalChunks = 0;
+static uint16_t asyncTransferId = 0;
 static unsigned long lastAsyncChunkTime = 0;
 static ModelConfig asyncConfigCopy;
 static uint8_t asyncTargetMac[6];
+static uint16_t nextConfigTransferId = 0;
+
+static portMUX_TYPE txDiagnosticsMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t txCallbackSuccessCount = 0;
+static uint32_t txCallbackFailureCount = 0;
+static uint32_t txQueueErrorCount = 0;
+
+static void onDataSent(const uint8_t *macAddr, esp_now_send_status_t status) {
+  (void)macAddr;
+  portENTER_CRITICAL(&txDiagnosticsMux);
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    txCallbackSuccessCount++;
+  } else {
+    txCallbackFailureCount++;
+  }
+  portEXIT_CRITICAL(&txDiagnosticsMux);
+}
 
 /**
  * @brief Liefert den aktuell gueltigen Anzeigenamen eines gepairten Modells fuer Top-Bar und UI.
@@ -130,6 +154,7 @@ static const char *get_display_model_name(int modelIdx) {
  */
 static void notify_model_switch_async_cb(void *user_data) {
   int newIdx = (int)(intptr_t)user_data;
+  if (newIdx != activeModelIndex) return;
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
   SerialInterface::printDebug(SerialInterface::Module::EspNow, "[DEBUG] Modellwechsel UI-Hook ausgeloesst (newModelIndex=%d).\n", newIdx);
   }
@@ -208,35 +233,34 @@ static void onDataReceive(const uint8_t *macAddr, const uint8_t *incomingData, i
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
       SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] Verzweigung: MSG_TYPE_PAIRING (0x03)");
   }
-      if (is_pairing_window_active() && senderIndex < 0) {
-        PairingMessage pMsg;
-        if (len >= (int)sizeof(PairingMessage)) {
-          memcpy(&pMsg, incomingData, sizeof(PairingMessage));
-          if (pMsg.protocolVersion != PAIRING_PROTOCOL_VERSION) break;
-          if (pMsg.action == PAIRING_ACTION_ACK) {
-            handle_pairing_ack(macAddr, pMsg.nonce);
-            break;
-          }
-          if (pMsg.action != PAIRING_ACTION_DISCOVER) break;
-          if (memcmp(pMsg.receiverMAC, macAddr, 6) != 0) break;
-  if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
-          SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] Pairing-Paket gueltig. Name: '%s'", pMsg.modelName);
-  }
-          handle_discovered_peer_during_pairing(macAddr, pMsg.modelName, pMsg.nonce);
-        } else {
-          char fallbackName[MAX_NAME_LEN];
-          snprintf(fallbackName, MAX_NAME_LEN, "RX_%02X%02X", macAddr[4], macAddr[5]);
-  if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
-          SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] Pairing-Paket zu kurz. Nutze Fallback-Name: '%s'", fallbackName);
-  }
-          handle_discovered_peer_during_pairing(macAddr, fallbackName, 0);
+      if (len != (int)sizeof(PairingMessage)) break;
+      PairingMessage pMsg;
+      memcpy(&pMsg, incomingData, sizeof(pMsg));
+      if (pMsg.protocolVersion != PAIRING_PROTOCOL_VERSION) break;
+      pMsg.modelName[MAX_NAME_LEN - 1] = '\0';
+
+      if (pMsg.action == PAIRING_ACTION_ACK) {
+        if (senderIndex >= 0 && memcmp(pMsg.receiverMAC, macAddr, 6) == 0) {
+          handle_pairing_ack(macAddr, pMsg.nonce);
         }
-      } else {
+        break;
+      }
+
+      if (pMsg.action != PAIRING_ACTION_DISCOVER ||
+          !is_pairing_window_active() ||
+          senderIndex >= 0 ||
+          pMsg.nonce == 0 ||
+          memcmp(pMsg.receiverMAC, macAddr, 6) != 0) {
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
         SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] Pairing ignoriert (Fenster aktiv: %s, Absender bekannt Index: %d)",
                                      is_pairing_window_active() ? "JA" : "NEIN", senderIndex);
   }
+        break;
       }
+      if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
+        SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] Pairing-Paket gueltig. Name: '%s'", pMsg.modelName);
+      }
+      handle_discovered_peer_during_pairing(macAddr, pMsg.modelName, pMsg.nonce);
       break;
     }
 
@@ -316,57 +340,66 @@ static void onDataReceive(const uint8_t *macAddr, const uint8_t *incomingData, i
     }
 
     case MSG_TYPE_CONFIG_DATA: {
-      if (senderIndex >= 0) {
-        pairedModels[senderIndex].lastTelemetryTime = millis();
+      if (senderIndex < 0 || len != (int)sizeof(ESPNowTransferMessage)) break;
+      ESPNowTransferMessage msg;
+      memcpy(&msg, incomingData, sizeof(msg));
+
+      const uint8_t expectedChunks = (uint8_t)((sizeof(ModelConfig) + 239U) / 240U);
+      if (msg.totalChunks != expectedChunks || msg.chunkIndex >= expectedChunks) break;
+      const size_t offset = (size_t)msg.chunkIndex * 240U;
+      const size_t expectedLength = min((size_t)240U, sizeof(ModelConfig) - offset);
+      if (msg.dataLength != expectedLength) break;
+
+      const unsigned long now = millis();
+      if (senderConfigTransferActive && now - lastSenderChunkMs > senderChunkTimeoutMs) {
+        senderConfigTransferActive = false;
+        receivedSenderChunksMask = 0;
       }
 
-      if (len >= (int)sizeof(ESPNowTransferMessage)) {
-        ESPNowTransferMessage *msg = (ESPNowTransferMessage *)incomingData;
-        if (msg->chunkIndex == 0) {
-          memset(&incomingConfigBuffer, 0, sizeof(ModelConfig));
-          expectedSenderChunks = msg->totalChunks;
-          receivedSenderChunksCounter = 0;
-  if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
-          SerialInterface::printDebug(SerialInterface::Module::EspNow, "[DEBUG] Starte Empfang von Config-Chunks. Erwartet: %u | sizeof(ModelConfig)=%u\n",
-                        (unsigned int)expectedSenderChunks, (unsigned int)sizeof(ModelConfig));
-  }
+      if (!senderConfigTransferActive ||
+          msg.transferId != activeSenderTransferId ||
+          memcmp(senderTransferSourceMAC, macAddr, 6) != 0) {
+        if (msg.chunkIndex != 0) break;
+        memset(&incomingConfigBuffer, 0, sizeof(incomingConfigBuffer));
+        activeSenderTransferId = msg.transferId;
+        memcpy(senderTransferSourceMAC, macAddr, 6);
+        expectedSenderChunks = expectedChunks;
+        receivedSenderChunksMask = 0;
+        senderConfigTransferActive = true;
+      }
+
+      const uint32_t chunkBit = 1UL << msg.chunkIndex;
+      if ((receivedSenderChunksMask & chunkBit) != 0) break;
+      memcpy(((uint8_t *)&incomingConfigBuffer) + offset, msg.payload, expectedLength);
+      receivedSenderChunksMask |= chunkBit;
+      lastSenderChunkMs = now;
+      const uint32_t expectedMask = (1UL << expectedSenderChunks) - 1UL;
+
+      if (receivedSenderChunksMask == expectedMask) {
+        pendingIncomingConfig = incomingConfigBuffer;
+        senderConfigTransferActive = false;
+        receivedSenderChunksMask = 0;
+        expectedSenderChunks = 0;
+
+        if (pendingIncomingConfig.channelCount == 0 ||
+            pendingIncomingConfig.channelCount > MAX_CHANNELS ||
+            memchr(pendingIncomingConfig.modelName, '\0', MAX_NAME_LEN) == NULL) {
+          break;
         }
 
-        size_t offset = (size_t)msg->chunkIndex * 240U;
-        int copyLen = min((int)msg->dataLength, 240);
-        if (copyLen > 0 && offset + (size_t)copyLen <= sizeof(ModelConfig)) {
-          memcpy(((uint8_t *)&incomingConfigBuffer) + offset, msg->payload, (size_t)copyLen);
-          receivedSenderChunksCounter++;
+        pairedModels[senderIndex].lastTelemetryTime = now;
+        if (pendingIncomingConfig.modelName[0] != '\0') {
+          strncpy(pairedModels[senderIndex].modelName, pendingIncomingConfig.modelName, MAX_NAME_LEN - 1);
+          pairedModels[senderIndex].modelName[MAX_NAME_LEN - 1] = '\0';
         }
 
-  if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
-        SerialInterface::printDebug(SerialInterface::Module::EspNow, "[DEBUG] Config-Chunk %u/%u empfangen (idx=%u, len=%d, counter=%u)\n",
-                      (unsigned int)(msg->chunkIndex + 1),
-                      (unsigned int)msg->totalChunks,
-                      (unsigned int)msg->chunkIndex,
-                      copyLen,
-                      (unsigned int)receivedSenderChunksCounter);
-  }
-
-        if (expectedSenderChunks > 0 && receivedSenderChunksCounter >= expectedSenderChunks) {
-          memset(&pendingIncomingConfig, 0, sizeof(ModelConfig));
-          memcpy(&pendingIncomingConfig, &incomingConfigBuffer, sizeof(ModelConfig));
-          receivedSenderChunksCounter = 0;
-          expectedSenderChunks = 0;
-
-          if (senderIndex >= 0 && strlen(pendingIncomingConfig.modelName) > 0) {
-            strncpy(pairedModels[senderIndex].modelName, pendingIncomingConfig.modelName, MAX_NAME_LEN - 1);
-            pairedModels[senderIndex].modelName[MAX_NAME_LEN - 1] = '\0';
-          }
-
-  if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
-          SerialInterface::printDebug(SerialInterface::Module::EspNow, "[DEBUG] Modellkonfiguration '%s' (%u Kanaele) komplett empfangen -> fuer Haupt-Loop vorgemerkt.\n",
-                        pendingIncomingConfig.modelName,
-                        (unsigned int)pendingIncomingConfig.channelCount);
-  }
-
-          pendingConfigReadyToProcess = true;
+        if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
+          SerialInterface::printDebug(SerialInterface::Module::EspNow,
+                                      "[ESP-NOW] Modellkonfiguration '%s' (%u Kanaele) vollstaendig empfangen.",
+                                      pendingIncomingConfig.modelName,
+                                      (unsigned int)pendingIncomingConfig.channelCount);
         }
+        pendingConfigReadyToProcess = true;
       }
       break;
     }
@@ -375,7 +408,11 @@ static void onDataReceive(const uint8_t *macAddr, const uint8_t *incomingData, i
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
       SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] Verzweigung: CONFIG_REQ (0x%02X)", packetType);
   }
-      if (senderIndex >= 0) {
+      if (senderIndex >= 0 && len == (int)sizeof(ESPNowTransferMessage)) {
+        ESPNowTransferMessage request;
+        memcpy(&request, incomingData, sizeof(request));
+        if (request.chunkIndex != 0 || request.totalChunks != 0 ||
+            request.dataLength != 0 || request.transferId != 0) break;
         pairedModels[senderIndex].lastTelemetryTime = millis();
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
         SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] lastTelemetryTime aktualisiert durch Config-Paket fuer Index %d", senderIndex);
@@ -420,9 +457,50 @@ void init_espnow_comm(void) {
   init_pairing_manager();
 
   esp_now_register_recv_cb(onDataReceive);
+  esp_now_register_send_cb(onDataSent);
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
   SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW] Kommunikationsmodul erfolgreich initialisiert.");
   }
+}
+
+void record_live_control_send_result(esp_err_t result) {
+  if (result == ESP_OK) return;
+  portENTER_CRITICAL(&txDiagnosticsMux);
+  txQueueErrorCount++;
+  portEXIT_CRITICAL(&txDiagnosticsMux);
+}
+
+void update_espnow_diagnostics(void) {
+  static unsigned long reportWindowStartMs = 0;
+  const unsigned long now = millis();
+  if (reportWindowStartMs == 0) {
+    reportWindowStartMs = now;
+    return;
+  }
+  if (now - reportWindowStartMs < 10000UL) return;
+  reportWindowStartMs = now;
+
+  uint32_t successes;
+  uint32_t failures;
+  uint32_t queueErrors;
+  portENTER_CRITICAL(&txDiagnosticsMux);
+  successes = txCallbackSuccessCount;
+  failures = txCallbackFailureCount;
+  queueErrors = txQueueErrorCount;
+  txCallbackSuccessCount = 0;
+  txCallbackFailureCount = 0;
+  txQueueErrorCount = 0;
+  portEXIT_CRITICAL(&txDiagnosticsMux);
+
+  if (!SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) return;
+  const uint32_t completed = successes + failures;
+  const float successPercent = (completed > 0)
+                                 ? (100.0f * (float)successes / (float)completed)
+                                 : 0.0f;
+  SerialInterface::printDebug(SerialInterface::Module::EspNow,
+                              "[ESP-NOW TX 10s] MAC-Rueckmeldung: %lu OK, %lu Fehler (%.1f%% OK), Queue-Fehler: %lu",
+                              (unsigned long)successes, (unsigned long)failures,
+                              successPercent, (unsigned long)queueErrors);
 }
 
 /**
@@ -466,6 +544,8 @@ void sendModelConfig(const ModelConfig &config, const uint8_t *peer_mac) {
   int bytesSent = 0;
   uint8_t chunkIdx = 0;
   uint8_t totalChunks = (totalSize + 239) / 240;
+  uint16_t transferId = ++nextConfigTransferId;
+  if (transferId == 0) transferId = ++nextConfigTransferId;
 
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
   SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW] Sende Modellkonfiguration an Peer (%d Bytes in %d Chunks)...", totalSize, totalChunks);
@@ -477,6 +557,7 @@ void sendModelConfig(const ModelConfig &config, const uint8_t *peer_mac) {
     msg.packetType = MSG_TYPE_CONFIG_DATA;
     msg.chunkIndex = chunkIdx;
     msg.totalChunks = totalChunks;
+    msg.transferId = transferId;
     int bytesToCopy = min(240, totalSize - bytesSent);
     msg.dataLength = bytesToCopy;
     memcpy(msg.payload, rawData + bytesSent, bytesToCopy);
@@ -511,6 +592,8 @@ void trigger_async_model_config_send(const ModelConfig &config, const uint8_t *p
   asyncBytesSent = 0;
   asyncChunkIdx = 0;
   asyncTotalChunks = (sizeof(ModelConfig) + 239) / 240;
+  asyncTransferId = ++nextConfigTransferId;
+  if (asyncTransferId == 0) asyncTransferId = ++nextConfigTransferId;
   isSendingConfigAsync = true;
   lastAsyncChunkTime = millis();
 
@@ -540,6 +623,7 @@ void update_async_model_config_sender(void) {
       msg.packetType = MSG_TYPE_CONFIG_DATA;
       msg.chunkIndex = asyncChunkIdx;
       msg.totalChunks = asyncTotalChunks;
+      msg.transferId = asyncTransferId;
 
       int bytesToCopy = min(240, totalSize - asyncBytesSent);
       msg.dataLength = bytesToCopy;
@@ -594,6 +678,7 @@ void multi_model_btn_cb(lv_event_t *e) {
     hasTelemetry = false;
     memset(&incomingTelemetry, 0, sizeof(TelemetryMessage));
     memset(receiverMAC, 0, 6);
+    on_model_page_active_model_changed(-1);
     trigger_audio_feedback(AUDIO_EVENT_CLICK);
     lv_async_call(notify_model_switch_async_cb, (void *)(intptr_t)(-1));
   } else {
@@ -610,6 +695,7 @@ void multi_model_btn_cb(lv_event_t *e) {
     } else {
       hasTelemetry = false;
     }
+    on_model_page_active_model_changed(modelIdx);
     trigger_audio_feedback(AUDIO_EVENT_MODEL_SWITCH);
     lv_async_call(notify_model_switch_async_cb, (void *)(intptr_t)modelIdx);
   }
@@ -714,8 +800,22 @@ void update_top_bar_ui(lv_obj_t *parent_cont) {
           snprintf(buf, sizeof(buf), "%s (OFFLINE)", dispName);
           lv_obj_set_style_bg_color(model_btn_array[slot], lv_palette_main(LV_PALETTE_RED), 0);
         } else if (modelIdx == activeModelIndex) {
-          snprintf(buf, sizeof(buf), "%s (%d dBm)", dispName, pairedModels[modelIdx].telemetry.rssi);
-          lv_obj_set_style_bg_color(model_btn_array[slot], lv_palette_main(LV_PALETTE_GREEN), 0);
+          int8_t rssi = pairedModels[modelIdx].telemetry.rssi;
+          if (rssi > -127 && rssi <= 0) {
+            snprintf(buf, sizeof(buf), "%s (%d dBm)", dispName, rssi);
+            if (rssi >= -55) {
+              lv_obj_set_style_bg_color(model_btn_array[slot], lv_palette_main(LV_PALETTE_GREEN), 0);
+            } else if (rssi >= -67) {
+              lv_obj_set_style_bg_color(model_btn_array[slot], lv_palette_main(LV_PALETTE_LIME), 0);
+            } else if (rssi >= -75) {
+              lv_obj_set_style_bg_color(model_btn_array[slot], lv_palette_main(LV_PALETTE_ORANGE), 0);
+            } else {
+              lv_obj_set_style_bg_color(model_btn_array[slot], lv_palette_main(LV_PALETTE_RED), 0);
+            }
+          } else {
+            snprintf(buf, sizeof(buf), "%s (RSSI --)", dispName);
+            lv_obj_set_style_bg_color(model_btn_array[slot], lv_palette_main(LV_PALETTE_GREY), 0);
+          }
         } else if (pairedModels[modelIdx].isOccupiedByOther) {
           snprintf(buf, sizeof(buf), "%s (%s)", dispName, pairedModels[modelIdx].occupantTransmitterName);
           lv_obj_set_style_bg_color(model_btn_array[slot], lv_palette_main(LV_PALETTE_ORANGE), 0);

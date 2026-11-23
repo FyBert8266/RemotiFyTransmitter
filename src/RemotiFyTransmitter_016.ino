@@ -246,6 +246,7 @@ void loop() {
   update_pairing_manager(); // WICHTIG: RegelmÃ¤ÃŸige ÃœberprÃ¼fung des Pairing-Managers (fÃ¼r thread-sichere Popups & Timeout)
   process_pending_received_config(); // Entkoppelte Verarbeitung komplett empfangener Config-Chunks ausserhalb onDataReceive()
   update_async_model_config_sender(); // --- NEU: Asynchronen Config-Sender in jedem Loop-Durchlauf bedienen ---
+  update_espnow_diagnostics();
 
   static unsigned long lastStatusUpdate = 0;
   if (millis() - lastStatusUpdate >= 1000) {

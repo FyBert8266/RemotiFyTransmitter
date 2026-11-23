@@ -15,8 +15,6 @@
 #include "hardware_io.h"
 #include "dashboard_page.h"
 
-extern ModelConfig currentConfig;
-
 // Interner Puffer fuer die Daempfung (gleitender Mittelwert pro Kanal in PWM-Einheiten)
 static float lastProcessedValues[MAX_CHANNELS] = {1500.0f};
 
@@ -39,12 +37,12 @@ static void print_vram_status(const char *tag) {
 /**
  * @brief Berechnet den verarbeiteten PWM-Kanalwert (1000 bis 2000 us) gemaess ChannelConfig.
  */
-uint16_t calculateProcessedChannelValue(int channel_idx, uint16_t raw_pwm) {
-  if (channel_idx < 0 || channel_idx >= currentConfig.channelCount) {
+uint16_t calculateProcessedChannelValue(const ModelConfig &config, int channel_idx, uint16_t raw_pwm) {
+  if (channel_idx < 0 || channel_idx >= config.channelCount || channel_idx >= MAX_CHANNELS) {
     return 1500; // Neutralwert bei ungueltigem Index
   }
 
-  ChannelConfig &chan = currentConfig.channels[channel_idx];
+  const ChannelConfig &chan = config.channels[channel_idx];
 
   // Bei aktivem Winden-Sperrschalter wird der WINCH-Kanal strikt auf 1500 us gehalten
   if (strcmp(chan.name, "WINCH") == 0 && is_winch_locked()) {

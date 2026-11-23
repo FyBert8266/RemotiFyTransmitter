@@ -29,6 +29,7 @@
 #include "audio_module.h"
 #include "SerialInterface.h"
 #include "pairing_manager.h"
+#include "core_tasks.h"
 
 #pragma region MODEL_PAGE_GLOBALS
 // Globale UI-Referenzen und Statusvariablen fuer das Modell
@@ -190,12 +191,15 @@ static bool sync_current_config_with_connected_model(bool forceOverwrite = false
   }
 
   if (pairedModels[conn_idx].config.channelCount > 0 || strlen(pairedModels[conn_idx].config.modelName) > 0) {
-    currentConfig = pairedModels[conn_idx].config;
-    if (strlen(currentConfig.modelName) == 0 && strlen(pairedModels[conn_idx].modelName) > 0) {
-      strncpy(currentConfig.modelName, pairedModels[conn_idx].modelName, MAX_NAME_LEN - 1);
-      currentConfig.modelName[MAX_NAME_LEN - 1] = '\0';
+    ModelConfig activeConfig = pairedModels[conn_idx].config;
+    if (strlen(activeConfig.modelName) == 0 && strlen(pairedModels[conn_idx].modelName) > 0) {
+      strncpy(activeConfig.modelName, pairedModels[conn_idx].modelName, MAX_NAME_LEN - 1);
+      activeConfig.modelName[MAX_NAME_LEN - 1] = '\0';
     }
-    lastSavedConfig = currentConfig;
+    portENTER_CRITICAL(&configMux);
+    currentConfig = activeConfig;
+    portEXIT_CRITICAL(&configMux);
+    lastSavedConfig = activeConfig;
     is_config_changed = false;
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::Models)) {
     SerialInterface::printDebug(SerialInterface::Module::Models, "[MODEL_PAGE][TRACE] sync_current_config ausgefuehrt von pairedModels[%d] ('%s', ch=%d)\n",
@@ -470,7 +474,23 @@ void on_model_page_active_model_changed(int newModelIndex) {
   
   }
   last_tracked_model_idx = (int8_t)newModelIndex;
-  sync_current_config_with_connected_model(true);
+  if (pairedModels != NULL &&
+      newModelIndex >= 0 &&
+      newModelIndex < MAX_PAIRED_MODELS &&
+      pairedModels[newModelIndex].isPaired) {
+    ModelConfig activeConfig = pairedModels[newModelIndex].config;
+    if (activeConfig.channelCount > 0 || activeConfig.modelName[0] != '\0') {
+      if (activeConfig.modelName[0] == '\0') {
+        strncpy(activeConfig.modelName, pairedModels[newModelIndex].modelName, MAX_NAME_LEN - 1);
+        activeConfig.modelName[MAX_NAME_LEN - 1] = '\0';
+      }
+      portENTER_CRITICAL(&configMux);
+      currentConfig = activeConfig;
+      portEXIT_CRITICAL(&configMux);
+      lastSavedConfig = activeConfig;
+      is_config_changed = false;
+    }
+  }
   if (channel_list_subpage && lv_obj_is_valid(channel_list_subpage)) {
     build_channel_list_page();
   }
