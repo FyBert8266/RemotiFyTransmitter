@@ -212,17 +212,24 @@ static void onDataReceive(const uint8_t *macAddr, const uint8_t *incomingData, i
         PairingMessage pMsg;
         if (len >= (int)sizeof(PairingMessage)) {
           memcpy(&pMsg, incomingData, sizeof(PairingMessage));
+          if (pMsg.protocolVersion != PAIRING_PROTOCOL_VERSION) break;
+          if (pMsg.action == PAIRING_ACTION_ACK) {
+            handle_pairing_ack(macAddr, pMsg.nonce);
+            break;
+          }
+          if (pMsg.action != PAIRING_ACTION_DISCOVER) break;
+          if (memcmp(pMsg.receiverMAC, macAddr, 6) != 0) break;
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
           SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] Pairing-Paket gueltig. Name: '%s'", pMsg.modelName);
   }
-          handle_discovered_peer_during_pairing(macAddr, pMsg.modelName);
+          handle_discovered_peer_during_pairing(macAddr, pMsg.modelName, pMsg.nonce);
         } else {
           char fallbackName[MAX_NAME_LEN];
           snprintf(fallbackName, MAX_NAME_LEN, "RX_%02X%02X", macAddr[4], macAddr[5]);
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {
           SerialInterface::printDebug(SerialInterface::Module::EspNow, "[ESP-NOW DEBUG] Pairing-Paket zu kurz. Nutze Fallback-Name: '%s'", fallbackName);
   }
-          handle_discovered_peer_during_pairing(macAddr, fallbackName);
+          handle_discovered_peer_during_pairing(macAddr, fallbackName, 0);
         }
       } else {
   if (SerialInterface::isModuleEnabled(SerialInterface::Module::EspNow)) {

@@ -76,7 +76,8 @@ void update_pairing_manager(void);
  * @param mac Zeiger auf die 6-Byte MAC-Adresse des unbekannten Empfaengers.
  * @param detectedModelName Vom Empfaenger gemeldeter Modellname (falls verfuegbar, sonst Fallback).
  */
-void handle_discovered_peer_during_pairing(const uint8_t *mac, const char *detectedModelName);
+void handle_discovered_peer_during_pairing(const uint8_t *mac, const char *detectedModelName, uint32_t nonce);
+bool handle_pairing_ack(const uint8_t *mac, uint32_t nonce);
 
 /**
  * @brief Aktualisiert den Modellnamen eines gepairten Empfaengers und speichert bei Aenderung in LittleFS.

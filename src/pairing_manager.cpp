@@ -32,6 +32,8 @@ static bool pendingConfirmationOpen = false;
 static volatile bool requestShowPopup = false;
 static uint8_t pendingMac[6] = {0};
 static char pendingModelName[MAX_NAME_LEN] = {0};
+static uint32_t pendingPairingNonce = 0;
+static bool pendingPairingAck = false;
 static lv_obj_t *popup_pairing_win = NULL;
 
 extern void refresh_models_list_ui(void);
@@ -157,6 +159,9 @@ static void btn_confirm_pair_cb(lv_event_t *e) {
     PairingMessage pMsg;
     memset(&pMsg, 0, sizeof(PairingMessage));
     pMsg.packetType = MSG_TYPE_PAIRING;
+    pMsg.action = PAIRING_ACTION_CONFIRM;
+    pMsg.protocolVersion = PAIRING_PROTOCOL_VERSION;
+    pMsg.nonce = pendingPairingNonce;
     memcpy(pMsg.receiverMAC, pendingMac, 6);
     strncpy(pMsg.modelName, pairedModels[targetSlot].modelName, MAX_NAME_LEN - 1);
     pMsg.modelName[MAX_NAME_LEN - 1] = '\0';
@@ -166,6 +171,7 @@ static void btn_confirm_pair_cb(lv_event_t *e) {
     strncpy(pMsg.senderName, sName, sizeof(pMsg.senderName) - 1);
     pMsg.senderName[sizeof(pMsg.senderName) - 1] = '\0';
 
+    pendingPairingAck = true;
     esp_now_send(pendingMac, (uint8_t *)&pMsg, sizeof(PairingMessage));
     request_model_config_from_peer(pendingMac);
 
@@ -492,6 +498,21 @@ void stop_pairing_window(void) {
   requestShowPopup = false;
 }
 
+bool handle_pairing_ack(const uint8_t *mac, uint32_t nonce) {
+  if (!mac || !pendingPairingAck) return false;
+  if (nonce == 0 || nonce != pendingPairingNonce) return false;
+  if (memcmp(mac, pendingMac, 6) != 0) return false;
+
+  pendingPairingAck = false;
+  trigger_audio_feedback(AUDIO_EVENT_MODEL_SWITCH);
+  if (SerialInterface::isModuleEnabled(SerialInterface::Module::Pairing)) {
+    SerialInterface::printDebug(SerialInterface::Module::Pairing,
+                                "[PAIRING] Pairing-ACK bestaetigt (Nonce 0x%08X).",
+                                (unsigned int)nonce);
+  }
+  return true;
+}
+
 bool is_pairing_window_active(void) {
   return pairingWindowActive;
 }
@@ -515,9 +536,10 @@ void update_pairing_manager(void) {
   }
 }
 
-void handle_discovered_peer_during_pairing(const uint8_t *mac, const char *detectedModelName) {
+void handle_discovered_peer_during_pairing(const uint8_t *mac, const char *detectedModelName, uint32_t nonce) {
   if (!pairingWindowActive || !mac || !ensure_paired_models_allocated()) return;
   if (pendingConfirmationOpen || requestShowPopup) return;
+  if (nonce == 0) return;
 
   for (int i = 0; i < MAX_PAIRED_MODELS; i++) {
     if (pairedModels[i].isPaired && memcmp(pairedModels[i].macAddress, mac, 6) == 0) {
@@ -526,6 +548,8 @@ void handle_discovered_peer_during_pairing(const uint8_t *mac, const char *detec
   }
 
   memcpy(pendingMac, mac, 6);
+  pendingPairingNonce = nonce;
+  pendingPairingAck = false;
 
   if (detectedModelName != NULL && strlen(detectedModelName) > 0) {
     strncpy(pendingModelName, detectedModelName, MAX_NAME_LEN - 1);

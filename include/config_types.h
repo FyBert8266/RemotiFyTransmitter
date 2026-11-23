@@ -29,6 +29,11 @@
 #define MSG_TYPE_TELEMETRY       0x05
 #define MSG_TYPE_LIVE_DATA       0x99
 
+#define PAIRING_ACTION_DISCOVER  0x01
+#define PAIRING_ACTION_CONFIRM   0x02
+#define PAIRING_ACTION_ACK       0x03
+#define PAIRING_PROTOCOL_VERSION 1
+
 
 // ============================================================
 // ENUMS & KONSTANTEN
@@ -173,11 +178,14 @@ struct __attribute__((packed)) SystemCalibrationConfig {
   char senderName[16];        // NEU: Persistenter Sendername für Kopplung & Status
 };
 
-struct PairingMessage {
-  uint8_t packetType;       // Typ-Byte (MSG_TYPE_PAIRING = 0x03)
-  uint8_t receiverMAC[6];   // MAC-Adresse des Empfängers
-  char modelName[16];       // Echter Modellname aus der Konfiguration
-  char senderName[MAX_NAME_LEN];           // Name des Senders für die Kopplung
+struct __attribute__((packed)) PairingMessage {
+  uint8_t packetType;                 // Typ-Byte (MSG_TYPE_PAIRING = 0x03)
+  uint8_t action;                     // DISCOVER, CONFIRM oder ACK
+  uint8_t protocolVersion;
+  uint32_t nonce;                     // Zufallige Pairing-Challenge
+  uint8_t receiverMAC[6];             // MAC-Adresse des angefragten Empfaengers
+  char modelName[MAX_NAME_LEN];
+  char senderName[MAX_NAME_LEN];
 };
 
 #endif // CONFIG_TYPES_H
